@@ -1,0 +1,46 @@
+# Fairy2 W1 (1-stage) training configuration
+# ~1 bit per weight, most aggressive quantization
+
+stage: fairy2_qat
+mode: w1
+
+# Quantization settings
+quantization:
+  num_stages: 1  # W1 = single stage = ~1 bit per weight
+  use_axis_scaling: true
+
+# Optimizer (AdamW per Fairy2i paper)
+optimizer:
+  type: adamw
+  lr: 5e-5  # Lower LR for aggressive quantization
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+
+# Scheduler (Warmup-Stable-Decay)
+scheduler:
+  type: wsd
+  warmup_steps: 500
+  decay_ratio: 0.1
+
+# Training settings
+max_steps: 10000
+max_seq_length: 512
+batch_size: 8
+gradient_accumulation_steps: 8
+gradient_clipping: 1.0
+
+# Logging
+log_interval: 100
+logging:
+  wandb:
+    enabled: true
+    project: wrinklefree-fairy2
+    tags: [fairy2, w1, qat]
+
+# Checkpointing
+save_interval: 2000
+output_dir: ./outputs
+
+# Loss settings
+ignore_index: -100
+label_smoothing: 0.0

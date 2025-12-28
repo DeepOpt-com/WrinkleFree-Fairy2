@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Hydra outputs
+outputs/
+multirun/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Model checkpoints
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+
+# Lock file (optional - can include for reproducibility)
+# uv.lock
+
+# OS
+.DS_Store
+Thumbs.db

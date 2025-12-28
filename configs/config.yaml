@@ -1,0 +1,34 @@
+# Main Hydra config for WrinkleFree-Fairy2
+# Fairy2i: Complex-valued LLM quantization with weights in {+1, -1, +i, -i}
+
+defaults:
+  - _self_
+  - model: smollm2_135m
+  - training: fairy2_w2
+  - data: mixed_pretrain
+  - distributed: single_gpu
+  - override hydra/hydra_logging: disabled
+  - override hydra/job_logging: disabled
+
+# Random seed for reproducibility
+seed: 42
+
+# Output directory for checkpoints and logs
+output_dir: ./outputs
+
+# Experiment naming
+experiment_name: fairy2_${model.name}_${training.mode}
+
+# Google Cloud Storage settings
+gcs:
+  enabled: false
+  bucket: wrinklefree-checkpoints
+  prefix: fairy2_experiments
+
+# Hydra output directory structure
+hydra:
+  run:
+    dir: ${output_dir}/${experiment_name}/${now:%Y-%m-%d_%H-%M-%S}
+  sweep:
+    dir: ${output_dir}/sweeps/${experiment_name}
+    subdir: ${hydra.job.num}

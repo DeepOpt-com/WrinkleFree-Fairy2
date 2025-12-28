@@ -1,0 +1,16 @@
+# Single GPU training configuration
+
+backend: nccl
+world_size: 1
+
+# No FSDP for single GPU
+fsdp:
+  enabled: false
+
+# Gradient checkpointing to save memory
+gradient_checkpointing: false
+
+# Mixed precision
+mixed_precision:
+  enabled: true
+  dtype: bfloat16

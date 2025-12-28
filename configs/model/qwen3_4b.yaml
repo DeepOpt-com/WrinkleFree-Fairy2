@@ -1,0 +1,21 @@
+# Qwen3-4B model configuration
+# License: Apache 2.0 (commercially friendly)
+
+name: qwen3_4b
+pretrained: Qwen/Qwen3-4B
+
+# Model architecture info (for reference)
+hidden_size: 2560
+num_layers: 36
+num_heads: 20
+vocab_size: 151936
+
+# Training settings for this model size
+recommended_batch_size: 8
+recommended_seq_len: 512
+
+# Trust remote code for custom architectures
+trust_remote_code: true
+
+# Data type for loading
+dtype: bfloat16

@@ -1,0 +1,23 @@
+# Multi-GPU FSDP training configuration
+
+backend: nccl
+world_size: null  # Auto-detect
+
+# FSDP settings
+fsdp:
+  enabled: true
+  sharding_strategy: FULL_SHARD
+  mixed_precision: true
+  use_orig_params: true
+  sync_module_states: true
+
+# Gradient checkpointing to save memory
+gradient_checkpointing: true
+
+# Mixed precision
+mixed_precision:
+  enabled: true
+  dtype: bfloat16
+
+# Activation checkpointing
+activation_checkpointing: true

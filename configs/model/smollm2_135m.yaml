@@ -1,0 +1,21 @@
+# SmolLM2-135M model configuration
+# License: Apache 2.0 (commercially friendly)
+
+name: smollm2_135m
+pretrained: HuggingFaceTB/SmolLM2-135M
+
+# Model architecture info (for reference)
+hidden_size: 576
+num_layers: 30
+num_heads: 9
+vocab_size: 49152
+
+# Training settings for this model size
+recommended_batch_size: 32
+recommended_seq_len: 512
+
+# Trust remote code for custom architectures
+trust_remote_code: true
+
+# Data type for loading
+dtype: bfloat16
