@@ -6,6 +6,7 @@ combines:
 2. Phase-aware quantization to {+1, -1, +i, -i}
 3. Recursive residual quantization (for W2 mode)
 4. Straight-through estimator for QAT training
+5. Optional int8 activation quantization
 
 The layer maintains master weights in full precision (FP32) for training
 stability, and applies quantization during the forward pass with STE for
@@ -24,6 +25,61 @@ import torch.nn.functional as F
 
 from fairy2.quantization.residual import ResidualQuantizer
 from fairy2.quantization.ste import complex_detach_ste
+
+
+def activation_quantization_per_token(
+    x: torch.Tensor,
+    bits: int = 8,
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    """Quantize activations to 8-bit using per-token absmax scaling.
+
+    Matches WrinkleFree-1.58Quant implementation exactly.
+
+    Uses per-token quantization:
+        scale = 127 / max(|X|, dim=-1)
+        X_quant = round(clip(X * scale, -128, 127)) / scale
+
+    This preserves the relative magnitudes within each token's representation.
+
+    Args:
+        x: Activation tensor of shape (..., hidden_size)
+        bits: Number of bits for quantization (default 8)
+        eps: Small constant for numerical stability
+
+    Returns:
+        Quantized activation tensor
+    """
+    # Compute per-token scale (absmax along last dimension)
+    max_val = 2 ** (bits - 1) - 1  # 127 for 8-bit
+    min_val = -(2 ** (bits - 1))  # -128 for 8-bit
+
+    # Per-token absmax
+    absmax = x.abs().max(dim=-1, keepdim=True).values.clamp(min=eps)
+    scale = max_val / absmax
+
+    # Quantize
+    x_scaled = x * scale
+    x_quant = x_scaled.round().clamp(min_val, max_val)
+
+    # Unscale
+    return x_quant / scale
+
+
+class Int8ActivationSTE(torch.autograd.Function):
+    """Straight-through estimator for int8 activation quantization.
+
+    Uses per-token absmax scaling matching WrinkleFree-1.58Quant.
+    """
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor) -> torch.Tensor:
+        return activation_quantization_per_token(x)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:
+        # Straight-through: pass gradients unchanged
+        return grad_output
 
 
 class Fairy2Linear(nn.Module):
@@ -45,11 +101,13 @@ class Fairy2Linear(nn.Module):
             - 1 = W1 mode (~1 bit per weight)
             - 2 = W2 mode (~2 bits per weight)
         bias: Whether to include bias (default: False)
+        quantize_activations: Whether to quantize activations to int8 (default: True)
 
     Attributes:
         U_re, U_im: Master weights for holomorphic component U
         W_re, W_im: Master weights for non-holomorphic component W
         num_stages: Number of quantization stages
+        quantize_activations: Whether int8 activation quantization is enabled
 
     Example:
         >>> layer = Fairy2Linear(128, 256, num_stages=2)
@@ -74,6 +132,7 @@ class Fairy2Linear(nn.Module):
         out_features: int,
         num_stages: int = 2,
         bias: bool = False,
+        quantize_activations: bool = True,
     ):
         super().__init__()
 
@@ -85,6 +144,7 @@ class Fairy2Linear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.num_stages = num_stages
+        self.quantize_activations = quantize_activations
 
         # Complex dimensions
         self.complex_in = in_features // 2
@@ -125,6 +185,7 @@ class Fairy2Linear(nn.Module):
         cls,
         linear: nn.Linear,
         num_stages: int = 2,
+        quantize_activations: bool = True,
     ) -> Fairy2Linear:
         """Create a Fairy2Linear from a real-valued nn.Linear.
 
@@ -135,6 +196,7 @@ class Fairy2Linear(nn.Module):
         Args:
             linear: Source nn.Linear layer (must have even in/out features)
             num_stages: Number of quantization stages (1=W1, 2=W2)
+            quantize_activations: Whether to quantize activations to int8
 
         Returns:
             Fairy2Linear: Equivalent Fairy2 quantized layer
@@ -149,7 +211,12 @@ class Fairy2Linear(nn.Module):
             )
 
         # Create new layer
-        layer = cls(in_features, out_features, num_stages=num_stages, bias=has_bias)
+        layer = cls(
+            in_features, out_features,
+            num_stages=num_stages,
+            bias=has_bias,
+            quantize_activations=quantize_activations,
+        )
 
         # Get the real weight matrix and partition it
         # Use float32 for precision during conversion
@@ -211,6 +278,15 @@ class Fairy2Linear(nn.Module):
         Returns:
             Output tensor of shape (..., out_features)
         """
+        # Quantize activations to int8 if enabled
+        if self.quantize_activations:
+            if self.training:
+                # Use STE for gradient flow during training
+                x = Int8ActivationSTE.apply(x)
+            else:
+                # Direct quantization during inference
+                x = activation_quantization_per_token(x)
+
         # Quantize weights
         U_re_q, U_im_q, W_re_q, W_im_q = self._quantize_weights()
 
@@ -281,5 +357,6 @@ class Fairy2Linear(nn.Module):
         """String representation for printing."""
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, "
-            f"num_stages={self.num_stages}, bias={self.bias_re is not None}"
+            f"num_stages={self.num_stages}, bias={self.bias_re is not None}, "
+            f"quantize_activations={self.quantize_activations}"
         )

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -28,6 +29,17 @@ from tqdm import tqdm
 from fairy2.training.loss import ContinuePretrainLoss
 
 logger = logging.getLogger(__name__)
+
+
+def get_gpu_memory_mb() -> dict[str, float]:
+    """Get GPU memory usage in MB."""
+    if not torch.cuda.is_available():
+        return {}
+    return {
+        "allocated": torch.cuda.memory_allocated() / 1024 / 1024,
+        "reserved": torch.cuda.memory_reserved() / 1024 / 1024,
+        "max_allocated": torch.cuda.max_memory_allocated() / 1024 / 1024,
+    }
 
 
 class Fairy2Trainer:
@@ -261,10 +273,17 @@ class Fairy2Trainer:
         log_interval = self.cfg.training.get("log_interval", 100)
         save_interval = self.cfg.training.get("save_interval", 5000)
         output_dir = Path(self.cfg.training.get("output_dir", "outputs"))
+        batch_size = self.cfg.training.get("batch_size", 8)
+        seq_len = self.cfg.training.get("max_seq_length", 2048)
+        tokens_per_step = batch_size * seq_len * grad_accum
 
         self.model.train()
         running_loss = 0.0
         num_samples = 0
+        total_tokens = 0
+        last_log_time = time.time()
+        last_log_tokens = 0
+        grad_norm = 0.0
 
         pbar = tqdm(total=max_steps, desc="Training")
 
@@ -300,35 +319,81 @@ class Fairy2Trainer:
 
                 # Optimizer step
                 if (self.global_step + 1) % grad_accum == 0:
-                    # Gradient clipping
+                    # Gradient clipping (and capture norm)
                     max_grad_norm = self.cfg.training.get("gradient_clipping", 1.0)
                     if max_grad_norm > 0:
-                        torch.nn.utils.clip_grad_norm_(
+                        grad_norm = torch.nn.utils.clip_grad_norm_(
                             self.model.parameters(), max_grad_norm
-                        )
+                        ).item()
+                    else:
+                        # Compute grad norm without clipping
+                        grad_norm = sum(
+                            p.grad.norm().item() ** 2 for p in self.model.parameters() if p.grad is not None
+                        ) ** 0.5
 
                     self.optimizer.step()
                     if self.scheduler is not None:
                         self.scheduler.step()
                     self.optimizer.zero_grad()
+                    total_tokens += tokens_per_step
 
                 self.global_step += 1
                 pbar.update(1)
 
                 # Logging
                 if self.global_step % log_interval == 0:
-                    avg_loss = running_loss / num_samples
+                    avg_loss = running_loss / max(num_samples, 1)
                     lr = self.optimizer.param_groups[0]["lr"]
+                    perplexity = min(torch.exp(torch.tensor(avg_loss)).item(), 1e6)  # Cap at 1M
 
-                    pbar.set_postfix({"loss": f"{avg_loss:.4f}", "lr": f"{lr:.2e}"})
+                    # Throughput calculation
+                    current_time = time.time()
+                    elapsed = current_time - last_log_time
+                    tokens_since_last = total_tokens - last_log_tokens
+                    tokens_per_sec = tokens_since_last / max(elapsed, 1e-6)
+                    last_log_time = current_time
+                    last_log_tokens = total_tokens
+
+                    # ETA calculation
+                    steps_remaining = max_steps - self.global_step
+                    secs_per_step = elapsed / max(log_interval, 1)
+                    eta_secs = steps_remaining * secs_per_step
+                    eta_hours = eta_secs / 3600
+
+                    pbar.set_postfix({
+                        "loss": f"{avg_loss:.4f}",
+                        "ppl": f"{perplexity:.1f}",
+                        "tok/s": f"{tokens_per_sec:.0f}",
+                        "lr": f"{lr:.2e}",
+                    })
 
                     if self.wandb_run is not None:
                         import wandb
+                        import math
+
                         wandb_log = {
+                            # Core training metrics
                             "train/loss": avg_loss,
+                            "train/perplexity": perplexity,
                             "train/lr": lr,
-                            "train/step": self.global_step,
+                            "train/grad_norm": grad_norm,
+                            # Progress metrics
+                            "progress/step": self.global_step,
+                            "progress/tokens": total_tokens,
+                            "progress/tokens_billions": total_tokens / 1e9,
+                            "progress/percent_complete": 100 * self.global_step / max_steps,
+                            "progress/eta_hours": eta_hours,
+                            # Throughput metrics
+                            "throughput/tokens_per_sec": tokens_per_sec,
+                            "throughput/samples_per_sec": tokens_per_sec / seq_len,
                         }
+
+                        # GPU memory stats
+                        gpu_mem = get_gpu_memory_mb()
+                        if gpu_mem:
+                            wandb_log["gpu/memory_allocated_mb"] = gpu_mem["allocated"]
+                            wandb_log["gpu/memory_reserved_mb"] = gpu_mem["reserved"]
+                            wandb_log["gpu/memory_max_allocated_mb"] = gpu_mem["max_allocated"]
 
                         # Log influence weights if using influence-aware training
                         if self.has_influence and self.mixed_dataset is not None:
@@ -336,7 +401,7 @@ class Fairy2Trainer:
                             for name, weight in weights.items():
                                 wandb_log[f"influence/weight_{name}"] = weight
 
-                        wandb.log(wandb_log)
+                        wandb.log(wandb_log, step=self.global_step)
 
                     running_loss = 0.0
                     num_samples = 0
