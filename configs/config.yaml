@@ -1,11 +1,13 @@
 # Main Hydra config for WrinkleFree-Fairy2
 # Fairy2i: Complex-valued LLM quantization with weights in {+1, -1, +i, -i}
+#
+# NOTE: Data config is NOT managed via Hydra. It lives in CheaperTraining
+# and is loaded automatically by create_pretraining_dataloader().
 
 defaults:
   - _self_
   - model: smollm2_135m
   - training: fairy2_w2
-  - data: mixed_pretrain
   - distributed: single_gpu
   - override hydra/hydra_logging: disabled
   - override hydra/job_logging: disabled

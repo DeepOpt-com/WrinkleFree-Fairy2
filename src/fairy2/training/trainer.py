@@ -1,10 +1,11 @@
-"""Fairy2 QAT Trainer.
+"""Fairy2 QAT Trainer with Influence-Based Data Selection.
 
 This module provides the training infrastructure for Fairy2i quantization-aware
 training. It follows patterns from WrinkleFree-1.58Quant for compatibility.
 
 Features:
 - Hydra configuration
+- Influence-based data selection (MobileLLM-R1 style)
 - FSDP distributed training
 - W&B logging
 - GCS checkpoint sync
@@ -34,14 +35,17 @@ class Fairy2Trainer:
 
     This trainer follows WrinkleFree patterns:
     - WSD scheduler (warmup-stable-decay)
+    - Influence-based data selection (MobileLLM-R1 style)
     - FSDP for multi-GPU
     - GCS checkpoint sync
     - W&B logging
 
     Args:
         model: Fairy2 model to train
-        train_dataloader: Training data loader
-        cfg: Hydra configuration
+        dataloader: Training data loader
+        config: Hydra configuration
+        mixed_dataset: MixedDataset for influence weight updates (optional)
+        probe_dataloaders: Dict of probe DataLoaders for influence (optional)
         optimizer: Optional pre-configured optimizer
         scheduler: Optional pre-configured scheduler
 
@@ -53,14 +57,18 @@ class Fairy2Trainer:
     def __init__(
         self,
         model: nn.Module,
-        train_dataloader: DataLoader,
-        cfg: DictConfig,
+        dataloader: DataLoader,
+        config: DictConfig,
+        mixed_dataset: Optional[Any] = None,
+        probe_dataloaders: Optional[dict] = None,
         optimizer: Optional[torch.optim.Optimizer] = None,
         scheduler: Optional[Any] = None,
     ):
         self.model = model
-        self.train_dataloader = train_dataloader
-        self.cfg = cfg
+        self.train_dataloader = dataloader
+        self.cfg = config
+        self.mixed_dataset = mixed_dataset
+        self.probe_dataloaders = probe_dataloaders
 
         # Setup device
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -68,8 +76,8 @@ class Fairy2Trainer:
 
         # Setup loss function
         self.loss_fn = ContinuePretrainLoss(
-            ignore_index=cfg.training.get("ignore_index", -100),
-            label_smoothing=cfg.training.get("label_smoothing", 0.0),
+            ignore_index=config.training.get("ignore_index", -100),
+            label_smoothing=config.training.get("label_smoothing", 0.0),
         )
 
         # Setup optimizer
@@ -77,6 +85,10 @@ class Fairy2Trainer:
             self.optimizer = self._create_optimizer()
         else:
             self.optimizer = optimizer
+
+        # Setup influence-based training (wraps optimizer if enabled)
+        self.has_influence = False
+        self._setup_influence()
 
         # Setup scheduler
         if scheduler is None:
@@ -90,7 +102,7 @@ class Fairy2Trainer:
 
         # W&B setup
         self.wandb_run = None
-        if cfg.training.get("logging", {}).get("wandb", {}).get("enabled", False):
+        if config.training.get("logging", {}).get("wandb", {}).get("enabled", False):
             self._setup_wandb()
 
     def _create_optimizer(self) -> torch.optim.Optimizer:
@@ -106,6 +118,78 @@ class Fairy2Trainer:
             )
         else:
             raise ValueError(f"Unknown optimizer type: {opt_cfg.type}")
+
+    def _setup_influence(self):
+        """Setup influence-based data selection if enabled.
+
+        Wraps self.optimizer with InfluenceAwareOptimizer when influence
+        is enabled in config and both mixed_dataset and probe_dataloaders
+        are available.
+        """
+        influence_config = self.cfg.training.get("influence", None)
+        if influence_config is None or not influence_config.get("enabled", False):
+            logger.info("Influence-based training: disabled")
+            return
+
+        if self.mixed_dataset is None:
+            logger.warning(
+                "Influence enabled but no mixed_dataset available. "
+                "Use data=mixed_pretrain for influence-based training."
+            )
+            return
+
+        if self.probe_dataloaders is None:
+            logger.warning(
+                "Influence enabled but no probe_dataloaders available. "
+                "Check data.probe config."
+            )
+            return
+
+        # Import influence components from CheaperTraining
+        try:
+            from cheapertraining import (
+                MixtureWeightCalculator,
+                InfluenceAwareOptimizer,
+                InfluenceConfig,
+            )
+        except ImportError:
+            logger.error(
+                "CheaperTraining influence module not found. "
+                "Install with: pip install -e ../WrinkleFree-CheaperTraining"
+            )
+            raise
+
+        logger.info("Setting up influence-based data selection")
+
+        # Create influence config
+        inf_config = InfluenceConfig(
+            lambda_reg=influence_config.config.get("lambda_val", 1e-4),
+        )
+
+        # Get first probe dataloader for mixture calculation
+        probe_dataloader = next(iter(self.probe_dataloaders.values()))
+
+        # Create mixture calculator
+        mixture_calc = MixtureWeightCalculator(
+            model=self.model,
+            probe_dataloader=probe_dataloader,
+            influence_config=inf_config,
+        )
+
+        # Wrap optimizer with influence-aware optimizer
+        self.optimizer = InfluenceAwareOptimizer(
+            optimizer=self.optimizer,
+            mixture_calculator=mixture_calc,
+            mixed_dataset=self.mixed_dataset,
+            update_interval=influence_config.get("update_interval", 1000),
+            learning_rate=influence_config.get("learning_rate", 0.2),
+            rank=0,  # Single GPU for now
+        )
+
+        self.has_influence = True
+        logger.info("Optimizer wrapped with InfluenceAwareOptimizer")
+        logger.info(f"  - Update interval: {influence_config.get('update_interval', 1000)} steps")
+        logger.info(f"  - Learning rate: {influence_config.get('learning_rate', 0.2)}")
 
     def _create_scheduler(self):
         """Create learning rate scheduler from config."""
@@ -240,11 +324,19 @@ class Fairy2Trainer:
 
                     if self.wandb_run is not None:
                         import wandb
-                        wandb.log({
+                        wandb_log = {
                             "train/loss": avg_loss,
                             "train/lr": lr,
                             "train/step": self.global_step,
-                        })
+                        }
+
+                        # Log influence weights if using influence-aware training
+                        if self.has_influence and self.mixed_dataset is not None:
+                            weights = self.mixed_dataset.get_current_weights()
+                            for name, weight in weights.items():
+                                wandb_log[f"influence/weight_{name}"] = weight
+
+                        wandb.log(wandb_log)
 
                     running_loss = 0.0
                     num_samples = 0

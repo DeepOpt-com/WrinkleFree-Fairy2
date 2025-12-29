@@ -7,9 +7,13 @@ This script runs a quick smoke test to verify that:
 3. Forward pass works
 4. Training loop runs without errors
 5. Checkpointing works
+6. CheaperTraining data loading works (optional)
 
 Usage:
     uv run python scripts/smoke_test.py --model smollm2_135m --mode w2 --steps 10
+
+    # With real data from CheaperTraining
+    uv run python scripts/smoke_test.py --model smollm2_135m --mode w2 --steps 10 --real-data
 """
 
 from __future__ import annotations
@@ -28,13 +32,14 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def run_smoke_test(model_name: str, mode: str, steps: int) -> bool:
+def run_smoke_test(model_name: str, mode: str, steps: int, real_data: bool = False) -> bool:
     """Run smoke test for Fairy2 training.
 
     Args:
         model_name: Model config name (e.g., "smollm2_135m")
         mode: Quantization mode ("w1" or "w2")
         steps: Number of training steps
+        real_data: Use real data from CheaperTraining (requires network)
 
     Returns:
         True if test passed, False otherwise
@@ -130,8 +135,46 @@ def run_smoke_test(model_name: str, mode: str, steps: int) -> bool:
         logger.error(f"  FAILED: Model conversion - {e}")
         return False
 
-    # Test 6: Forward pass
-    logger.info("Test 6: Forward pass...")
+    # Test 6: CheaperTraining data loading (optional)
+    dataloader = None
+    mixed_dataset = None
+    if real_data:
+        logger.info("Test 6: CheaperTraining data loading...")
+        try:
+            from fairy2.data import create_dataloader, CHEAPERTRAINING_AVAILABLE
+
+            if not CHEAPERTRAINING_AVAILABLE:
+                logger.warning("  SKIPPED: CheaperTraining not installed")
+            else:
+                # Use single-source config for simplicity
+                config = {
+                    "dataset": {
+                        "path": "HuggingFaceFW/fineweb-edu",
+                        "name": "sample-10BT",
+                    },
+                    "preprocessing": {
+                        "max_length": 512,
+                        "packed": True,
+                    },
+                }
+                dataloader, mixed_dataset = create_dataloader(
+                    config=config,
+                    tokenizer=tokenizer,
+                    batch_size=2,
+                    max_length=512,
+                )
+                # Try getting one batch
+                batch = next(iter(dataloader))
+                assert "input_ids" in batch
+                logger.info(f"  PASSED: CheaperTraining data loaded (shape: {batch['input_ids'].shape})")
+        except Exception as e:
+            logger.error(f"  FAILED: CheaperTraining data loading - {e}")
+            return False
+    else:
+        logger.info("Test 6: CheaperTraining data loading... SKIPPED (use --real-data)")
+
+    # Test 7: Forward pass
+    logger.info("Test 7: Forward pass...")
     try:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model = model.to(device)
@@ -146,8 +189,8 @@ def run_smoke_test(model_name: str, mode: str, steps: int) -> bool:
         logger.error(f"  FAILED: Forward pass - {e}")
         return False
 
-    # Test 7: Training loop
-    logger.info(f"Test 7: Training for {steps} steps...")
+    # Test 8: Training loop
+    logger.info(f"Test 8: Training for {steps} steps...")
     try:
         model.train()
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
@@ -179,8 +222,8 @@ def run_smoke_test(model_name: str, mode: str, steps: int) -> bool:
         logger.error(f"  FAILED: Training loop - {e}")
         return False
 
-    # Test 8: Save checkpoint
-    logger.info("Test 8: Saving checkpoint...")
+    # Test 9: Save checkpoint
+    logger.info("Test 9: Saving checkpoint...")
     try:
         checkpoint_dir = Path("outputs/smoke_test_checkpoint")
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -216,9 +259,14 @@ def main():
         default=10,
         help="Number of training steps",
     )
+    parser.add_argument(
+        "--real-data",
+        action="store_true",
+        help="Use real data from CheaperTraining (requires network)",
+    )
     args = parser.parse_args()
 
-    success = run_smoke_test(args.model, args.mode, args.steps)
+    success = run_smoke_test(args.model, args.mode, args.steps, args.real_data)
     sys.exit(0 if success else 1)
 
 

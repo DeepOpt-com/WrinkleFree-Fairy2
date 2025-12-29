@@ -44,3 +44,14 @@ output_dir: ./outputs
 # Loss settings
 ignore_index: -100
 label_smoothing: 0.0
+
+# Influence-based data selection (MobileLLM-R1 style)
+# Enabled by default with mixed_pretrain data config
+influence:
+  enabled: true
+  update_interval: 1000  # Recalculate mixture weights every N steps
+  learning_rate: 0.2     # Learning rate for weight updates
+  config:
+    lambda_val: 0.1      # Regularization term
+    gamma_val: 0.1       # Gamma term
+    temperature: 1.0

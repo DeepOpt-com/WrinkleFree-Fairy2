@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Main training script for Fairy2i QAT.
+"""Main training script for Fairy2i QAT with influence-based data selection.
 
 This script provides the main entry point for Fairy2i quantization-aware
-training. It uses Hydra for configuration management.
+training. It uses Hydra for configuration management and CheaperTraining
+for data loading with influence-based remixing.
 
 Usage:
     # Basic training with SmolLM2-135M
@@ -16,6 +17,9 @@ Usage:
 
     # Disable wandb
     uv run python scripts/train.py training.logging.wandb.enabled=false
+
+    # Disable influence-based training
+    uv run python scripts/train.py training.influence.enabled=false
 """
 
 from __future__ import annotations
@@ -35,6 +39,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from fairy2.models import convert_to_fairy2, count_fairy2_layers
 from fairy2.training import Fairy2Trainer
+from fairy2.data import (
+    create_pretraining_dataloader,
+    CHEAPERTRAINING_AVAILABLE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -63,42 +71,113 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def create_dataloader(cfg: DictConfig, tokenizer):
-    """Create training dataloader.
+def create_dataloaders(cfg: DictConfig, tokenizer):
+    """Create training and probe dataloaders using CheaperTraining.
 
-    For simplicity, we create a dummy dataloader for testing.
-    In production, replace with actual dataset loading.
+    Uses the high-level create_pretraining_dataloader() which loads the
+    data config from CheaperTraining's YAML files automatically.
+
+    Returns:
+        tuple: (train_dataloader, mixed_dataset, probe_dataloaders)
+            - train_dataloader: DataLoader for training
+            - mixed_dataset: MixedDataset for influence weight updates (or None)
+            - probe_dataloaders: dict of probe DataLoaders for influence (or None)
     """
-    from torch.utils.data import DataLoader, Dataset
+    if not CHEAPERTRAINING_AVAILABLE:
+        raise ImportError(
+            "CheaperTraining is required for Fairy2 training. "
+            "Install with: pip install -e ../WrinkleFree-CheaperTraining"
+        )
 
-    class DummyDataset(Dataset):
-        """Dummy dataset for testing."""
-
-        def __init__(self, tokenizer, seq_len=512, num_samples=10000):
-            self.tokenizer = tokenizer
-            self.seq_len = seq_len
-            self.num_samples = num_samples
-
-        def __len__(self):
-            return self.num_samples
-
-        def __getitem__(self, idx):
-            # Generate random tokens for testing
-            input_ids = torch.randint(0, self.tokenizer.vocab_size, (self.seq_len,))
-            return {"input_ids": input_ids, "labels": input_ids.clone()}
-
-    dataset = DummyDataset(
-        tokenizer,
-        seq_len=cfg.training.max_seq_length,
-        num_samples=cfg.training.max_steps * cfg.training.batch_size,
-    )
-
-    return DataLoader(
-        dataset,
+    # Use high-level convenience function - no data config needed here!
+    # Config lives in CheaperTraining's configs/data/mixed_pretrain.yaml
+    logger.info("Creating training dataloader from CheaperTraining (mixed_pretrain)")
+    train_dataloader, mixed_dataset, probe_dataloaders = create_pretraining_dataloader(
+        tokenizer=tokenizer,
         batch_size=cfg.training.batch_size,
-        shuffle=True,
-        num_workers=0,
+        max_length=cfg.training.max_seq_length,
+        config_name="mixed_pretrain",  # Loads from CheaperTraining's configs
+        with_probes=True,
+        seed=cfg.seed,
     )
+
+    if probe_dataloaders:
+        logger.info(f"Created {len(probe_dataloaders)} probe dataloaders: {list(probe_dataloaders.keys())}")
+
+    return train_dataloader, mixed_dataset, probe_dataloaders
+
+
+def setup_influence(cfg: DictConfig, model, mixed_dataset, probe_dataloaders, optimizer):
+    """Setup influence-based data selection if enabled.
+
+    Returns optimizer (wrapped with InfluenceAwareOptimizer if enabled).
+    """
+    influence_config = getattr(cfg.training, "influence", None)
+    if influence_config is None or not influence_config.get("enabled", False):
+        logger.info("Influence-based training: disabled")
+        return optimizer
+
+    if mixed_dataset is None:
+        logger.warning(
+            "Influence enabled but no mixed_dataset available. "
+            "Use data=mixed_pretrain for influence-based training."
+        )
+        return optimizer
+
+    if probe_dataloaders is None:
+        logger.warning(
+            "Influence enabled but no probe_dataloaders available. "
+            "Check data.probe config."
+        )
+        return optimizer
+
+    # Import influence components
+    try:
+        from cheapertraining import (
+            MixtureWeightCalculator,
+            InfluenceAwareOptimizer,
+            InfluenceConfig,
+        )
+    except ImportError:
+        logger.error(
+            "CheaperTraining influence module not found. "
+            "Install with: pip install -e ../WrinkleFree-CheaperTraining"
+        )
+        raise
+
+    logger.info("Setting up influence-based data selection")
+
+    # Create influence config
+    inf_config = InfluenceConfig(
+        lambda_reg=influence_config.config.get("lambda_val", 1e-4),
+    )
+
+    # Get first probe dataloader for mixture calculation
+    # (MixtureWeightCalculator expects single dataloader)
+    probe_dataloader = next(iter(probe_dataloaders.values()))
+
+    # Create mixture calculator
+    mixture_calc = MixtureWeightCalculator(
+        model=model,
+        probe_dataloader=probe_dataloader,
+        influence_config=inf_config,
+    )
+
+    # Wrap optimizer with influence-aware optimizer
+    optimizer = InfluenceAwareOptimizer(
+        optimizer=optimizer,
+        mixture_calculator=mixture_calc,
+        mixed_dataset=mixed_dataset,
+        update_interval=influence_config.get("update_interval", 1000),
+        learning_rate=influence_config.get("learning_rate", 0.2),
+        rank=0,  # Single GPU for now
+    )
+
+    logger.info("Optimizer wrapped with InfluenceAwareOptimizer")
+    logger.info(f"  - Update interval: {influence_config.get('update_interval', 1000)} steps")
+    logger.info(f"  - Learning rate: {influence_config.get('learning_rate', 0.2)}")
+
+    return optimizer
 
 
 @hydra.main(config_path="../configs", config_name="config", version_base=None)
@@ -138,13 +217,24 @@ def main(cfg: DictConfig) -> None:
     layer_counts = count_fairy2_layers(model)
     logger.info(f"Layer counts: {layer_counts}")
 
-    # Create dataloader
-    logger.info("Creating dataloader")
-    dataloader = create_dataloader(cfg, tokenizer)
+    # Create dataloaders
+    train_dataloader, mixed_dataset, probe_dataloaders = create_dataloaders(cfg, tokenizer)
+
+    # Log dataset info
+    if mixed_dataset is not None:
+        weights = mixed_dataset.get_current_weights()
+        logger.info(f"Initial dataset weights: {weights}")
 
     # Create trainer and train
+    # Note: Trainer creates optimizer internally, so we pass influence config
     logger.info("Starting training")
-    trainer = Fairy2Trainer(model, dataloader, cfg)
+    trainer = Fairy2Trainer(
+        model=model,
+        dataloader=train_dataloader,
+        config=cfg,
+        mixed_dataset=mixed_dataset,
+        probe_dataloaders=probe_dataloaders,
+    )
     results = trainer.train()
 
     logger.info(f"Training complete! Results: {results}")
